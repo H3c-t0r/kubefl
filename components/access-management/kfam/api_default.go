@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	profileRegister "github.com/kubeflow/kubeflow/components/access-management/pkg/apis/kubeflow/v1beta1"
@@ -43,14 +44,16 @@ type KfamV1Alpha1Interface interface {
 }
 
 type KfamV1Alpha1Client struct {
-	profileClient ProfileInterface
-	bindingClient BindingInterface
-	clusterAdmin  []string
-	userIdHeader  string
-	userIdPrefix  string
+	profileClient      ProfileInterface
+	bindingClient      BindingInterface
+	clusterAdmin       []string
+	userIdHeader       string
+	userIdPrefix       string
+	experimentalGroups bool
+	groupsHeader       string
 }
 
-func NewKfamClient(userIdHeader string, userIdPrefix string, clusterAdmin string) (*KfamV1Alpha1Client, error) {
+func NewKfamClient(userIdHeader string, userIdPrefix string, clusterAdmin string, experimentalGroups bool, groupsHeader string) (*KfamV1Alpha1Client, error) {
 	profileRESTClient, err := getRESTClient(profileRegister.GroupName, profileRegister.GroupVersion)
 	if err != nil {
 		return nil, err
@@ -83,9 +86,11 @@ func NewKfamClient(userIdHeader string, userIdPrefix string, clusterAdmin string
 			kubeClient:        kubeClient,
 			roleBindingLister: roleBindingLister,
 		},
-		clusterAdmin: []string{clusterAdmin},
-		userIdHeader: userIdHeader,
-		userIdPrefix: userIdPrefix,
+		clusterAdmin:       []string{clusterAdmin},
+		userIdHeader:       userIdHeader,
+		userIdPrefix:       userIdPrefix,
+		experimentalGroups: experimentalGroups,
+		groupsHeader:       groupsHeader,
 	}, nil
 }
 
@@ -114,7 +119,8 @@ func (c *KfamV1Alpha1Client) CreateBinding(w http.ResponseWriter, r *http.Reques
 	}
 	// check permission before create binding
 	useremail := c.getUserEmail(r.Header)
-	if c.isOwnerOrAdmin(useremail, binding.ReferredNamespace) {
+	groups := c.getUserGroups(r.Header)
+	if c.isOwnerOrAdmin(useremail, binding.ReferredNamespace, groups) {
 		err := c.bindingClient.Create(&binding, c.userIdHeader, c.userIdPrefix)
 		if err != nil {
 			IncRequestErrorCounter(err.Error(), useremail, action, r.URL.Path,
@@ -167,7 +173,8 @@ func (c *KfamV1Alpha1Client) DeleteBinding(w http.ResponseWriter, r *http.Reques
 	}
 	// check permission before delete
 	useremail := c.getUserEmail(r.Header)
-	if c.isOwnerOrAdmin(useremail, binding.ReferredNamespace) {
+	groups := c.getUserGroups(r.Header)
+	if c.isOwnerOrAdmin(useremail, binding.ReferredNamespace, groups) {
 		err := c.bindingClient.Delete(&binding)
 		if err != nil {
 			IncRequestErrorCounter(err.Error(), useremail, action, r.URL.Path,
@@ -190,7 +197,8 @@ func (c *KfamV1Alpha1Client) DeleteProfile(w http.ResponseWriter, r *http.Reques
 	useremail := c.getUserEmail(r.Header)
 	profileName := path.Base(r.RequestURI)
 	// check permission before delete
-	if c.isOwnerOrAdmin(useremail, profileName) {
+	groups := c.getUserGroups(r.Header)
+	if c.isOwnerOrAdmin(useremail, profileName, groups) {
 		err := c.profileClient.Delete(profileName, nil)
 		if err != nil {
 			IncRequestErrorCounter(err.Error(), useremail, action, r.URL.Path,
@@ -218,6 +226,12 @@ func (c *KfamV1Alpha1Client) ReadBinding(w http.ResponseWriter, r *http.Request)
 		writeResponse(w, []byte(err.Error()))
 		return
 	}
+
+	groups := []string{}
+	if c.experimentalGroups && queries.Get("groups") != "" {
+		groups = strings.Split(queries.Get("groups"), ",")
+	}
+
 	namespaces := []string{}
 	// by default scan all namespaces created by profile CR
 	if queries.Get("namespace") == "" {
@@ -232,7 +246,7 @@ func (c *KfamV1Alpha1Client) ReadBinding(w http.ResponseWriter, r *http.Request)
 	} else {
 		namespaces = append(namespaces, queries.Get("namespace"))
 	}
-	bindingList, err := c.bindingClient.List(queries.Get("user"), namespaces, queries.Get("role"))
+	bindingList, err := c.bindingClient.List(queries.Get("user"), groups, namespaces, queries.Get("role"))
 	if err != nil {
 		IncRequestErrorCounter(err.Error(), "", action, r.URL.Path,
 			SEVERITY_MAJOR)
@@ -290,6 +304,10 @@ func (c *KfamV1Alpha1Client) getUserEmail(header http.Header) string {
 	return header.Get(c.userIdHeader)[len(c.userIdPrefix):]
 }
 
+func (c *KfamV1Alpha1Client) getUserGroups(header http.Header) []string {
+	return strings.Split(header.Get(c.groupsHeader), ",")
+}
+
 func (c *KfamV1Alpha1Client) isClusterAdmin(queryUser string) bool {
 	for _, val := range c.clusterAdmin {
 		if val == queryUser {
@@ -299,12 +317,18 @@ func (c *KfamV1Alpha1Client) isClusterAdmin(queryUser string) bool {
 	return false
 }
 
+func (c *KfamV1Alpha1Client) isKubeflowAdmin(queryUser string, groups []string, profileName string) bool {
+	roles, err := c.bindingClient.List(queryUser, groups, []string{profileName}, roleBindingNameMap["kubeflow-admin"])
+	return err != nil && len(roles.Bindings) > 0
+}
+
 //isOwnerOrAdmin return true if queryUser is cluster admin or profile owner
-func (c *KfamV1Alpha1Client) isOwnerOrAdmin(queryUser string, profileName string) bool {
+func (c *KfamV1Alpha1Client) isOwnerOrAdmin(queryUser string, profileName string, groups []string) bool {
 	isAdmin := c.isClusterAdmin(queryUser)
+	isKubeflowAdmin := c.isKubeflowAdmin(queryUser, groups, profileName)
 	prof, err := c.profileClient.Get(profileName, metav1.GetOptions{})
 	if err != nil {
 		return false
 	}
-	return isAdmin || (prof.Spec.Owner.Name == queryUser)
+	return isAdmin || (prof.Spec.Owner.Name == queryUser) || (isKubeflowAdmin && c.experimentalGroups)
 }

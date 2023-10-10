@@ -34,6 +34,13 @@ import (
 const AuthorizationPolicy = "authorizationpolicies"
 const USER = "user"
 const ROLE = "role"
+const GROUP = "group"
+
+var bindingHierarchy = map[string]int{
+	"admin": 1,
+	"edit":  2,
+	"view":  3,
+}
 
 // roleBindingNameMap maps frontend role names to k8s role names and vice-versa
 var roleBindingNameMap = map[string]string{
@@ -48,7 +55,7 @@ var roleBindingNameMap = map[string]string{
 type BindingInterface interface {
 	Create(binding *Binding, userIdHeader string, userIdPrefix string) error
 	Delete(binding *Binding) error
-	List(user string, namespaces []string, role string) (*BindingEntries, error)
+	List(user string, groups []string, namespaces []string, role string) (*BindingEntries, error)
 }
 
 type BindingClient struct {
@@ -98,6 +105,40 @@ func getAuthorizationPolicy(binding *Binding, userIdHeader string, userIdPrefix 
 			},
 		},
 	}
+}
+
+// FilterMaxPermissionBindingsByNamespace takes a slice of Binding and returns a new slice that contains only one binding per
+// ReferredNamespace, with the maximum permission based on a global hierarchy map. The hierarchy is defined as follows:
+//
+// 1. kubeflowAdmin
+// 2. kubeflowEdit
+// 3. kubeflowView
+func FilterMaxPermissionBindingsByNamespace(bindings []Binding) []Binding {
+	var filteredBindings []Binding
+	namespaceBinding := make(map[string]Binding)
+
+	for _, binding := range bindings {
+		ns := binding.ReferredNamespace
+
+		// Check if there is already a binding for this namespace
+		existingBinding, exist := namespaceBinding[ns]
+
+		if !exist {
+			namespaceBinding[ns] = binding
+			continue
+		}
+
+		if bindingHierarchy[existingBinding.RoleRef.Name] > bindingHierarchy[binding.RoleRef.Name] {
+			namespaceBinding[ns] = binding
+		}
+	}
+
+	// Combine the filtered bindings for each namespace
+	for _, binding := range namespaceBinding {
+		filteredBindings = append(filteredBindings, binding)
+	}
+
+	return filteredBindings
 }
 
 func (c *BindingClient) Create(binding *Binding, userIdHeader string, userIdPrefix string) error {
@@ -183,7 +224,15 @@ func (c *BindingClient) Delete(binding *Binding) error {
 		Error()
 }
 
-func (c *BindingClient) List(user string, namespaces []string, role string) (*BindingEntries, error) {
+func (c *BindingClient) List(user string, groups []string, namespaces []string, role string) (*BindingEntries, error) {
+	if user == "" && len(groups) == 0 && len(namespaces) == 0 {
+		return nil, fmt.Errorf("at least one of user, groups, or namespaces must be specified")
+	}
+
+	// When we want to list the binding on user's info (user or groups) we return only one binding
+	// per namespace, the binding will be the one with the highest permission.
+	distinctBinding := user != "" || len(groups) > 0
+
 	bindings := []Binding{}
 	for _, ns := range namespaces {
 		roleBindings, err := c.roleBindingLister.RoleBindings(ns).List(labels.Everything())
@@ -191,39 +240,63 @@ func (c *BindingClient) List(user string, namespaces []string, role string) (*Bi
 			return nil, err
 		}
 		for _, roleBinding := range roleBindings {
-			userVal, ok := roleBinding.Annotations[USER]
-			if !ok {
+
+			// Ensure the role is matching
+			if role != "" && roleBinding.RoleRef.Name != role {
 				continue
 			}
-			if user != "" && user != userVal {
-				continue
+
+			// Iterate over the role binding subjects
+			for _, subject := range roleBinding.Subjects {
+
+				if user != "" || len(groups) > 0 {
+					switch subject.Kind {
+					case "User":
+						if user != "" && subject.Name == user {
+							bindings = append(bindings, Binding{
+								User:              &subject,
+								ReferredNamespace: ns,
+								RoleRef: &rbacv1.RoleRef{
+									Kind: roleBinding.RoleRef.Kind,
+									Name: roleBindingNameMap[roleBinding.RoleRef.Name],
+								},
+							})
+						}
+						break
+					case "Group":
+						if contains(groups, subject.Name) {
+							bindings = append(bindings, Binding{
+								User:              &subject,
+								ReferredNamespace: ns,
+								RoleRef: &rbacv1.RoleRef{
+									Kind: roleBinding.RoleRef.Kind,
+									Name: roleBindingNameMap[roleBinding.RoleRef.Name],
+								},
+							})
+						}
+					}
+				} else {
+					// If we do not want to filter based on groups or user we simply add the Subject and RoleRef
+					bindings = append(bindings, Binding{
+						User:              &subject,
+						ReferredNamespace: ns,
+						RoleRef: &rbacv1.RoleRef{
+							Kind: roleBinding.RoleRef.Kind,
+							Name: roleBindingNameMap[roleBinding.RoleRef.Name],
+						},
+					})
+				}
 			}
-			roleVal, ok := roleBinding.Annotations[ROLE]
-			if !ok {
-				continue
-			}
-			if role != "" && role != roleVal {
-				continue
-			}
-			if len(roleBinding.Subjects) != 1 {
-				return nil, fmt.Errorf("binding subject length not equal to 1, actual length: %v",
-					len(roleBinding.Subjects))
-			}
-			binding := Binding{
-				User: &rbacv1.Subject{
-					Kind: roleBinding.Subjects[0].Kind,
-					Name: roleBinding.Subjects[0].Name,
-				},
-				ReferredNamespace: ns,
-				RoleRef: &rbacv1.RoleRef{
-					Kind: roleBinding.RoleRef.Kind,
-					Name: roleBindingNameMap[roleBinding.RoleRef.Name],
-				},
-			}
-			bindings = append(bindings, binding)
 		}
 	}
+
 	return &BindingEntries{
-		Bindings: bindings,
+		Bindings: func() []Binding {
+			if distinctBinding {
+				return FilterMaxPermissionBindingsByNamespace(bindings)
+			}
+			return bindings
+		}(),
 	}, nil
+
 }
