@@ -81,3 +81,7 @@ export interface NotebookRawObject {
   };
   processed_status: Status;
 }
+
+export interface AllocatableGPU {
+  [vendor: string]: number;
+}
